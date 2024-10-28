@@ -253,6 +253,27 @@ func Test_ValidateTektonChain_ConfigArtifactsPipelineRunEnableDeepInspection(t *
 	}
 }
 
+func Test_ValidateTektonChain_ConfigBoolArtifactsPipelineRunEnableDeepInspection(t *testing.T) {
+	tc := &TektonChain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chain",
+			Namespace: "namespace",
+		},
+		Spec: TektonChainSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+		},
+	}
+
+	tc.Spec.Chain.ChainProperties.ArtifactsPipelineRunEnableDeepInspection = true
+	err := tc.Validate(context.TODO())
+
+	if err != nil {
+		t.Errorf("ValidateTektonChain.Validate() expected no error for the given config, but got one, ValidateTektonChain: %v", err)
+	}
+}
+
 func Test_ValidateTektonChain_ConfigInvalidX509SignerFulcioProvider(t *testing.T) {
 	tc := &TektonChain{
 		ObjectMeta: metav1.ObjectMeta{
