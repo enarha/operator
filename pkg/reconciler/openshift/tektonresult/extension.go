@@ -18,6 +18,7 @@ package tektonresult
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,7 +85,6 @@ func OpenShiftExtension(ctx context.Context) common.Extension {
 		logsRBACManifest:   logsRBACManifest,
 		tektonConfigLister: tektonConfigLister,
 		restConfig:         injection.GetConfig(ctx),
-		ctx:                ctx,
 	}
 	return ext
 }
@@ -96,13 +96,12 @@ type openshiftExtension struct {
 	tektonConfigLister interface {
 		Get(name string) (*v1alpha1.TektonConfig, error)
 	}
-	restConfig *rest.Config
-	ctx        context.Context
+	restConfig        *rest.Config
+	resolvedTLSConfig *occommon.TLSEnvVars
 }
 
-func (oe openshiftExtension) Transformers(comp v1alpha1.TektonComponent) []mf.Transformer {
+func (oe *openshiftExtension) Transformers(comp v1alpha1.TektonComponent) []mf.Transformer {
 	instance := comp.(*v1alpha1.TektonResult)
-	logger := logging.FromContext(oe.ctx)
 
 	transformers := []mf.Transformer{
 		occommon.RemoveRunAsUser(),
@@ -117,12 +116,9 @@ func (oe openshiftExtension) Transformers(comp v1alpha1.TektonComponent) []mf.Tr
 		injectPostgresUpgradeSupport(),
 	}
 
-	// Resolve TLS configuration with proper precedence:
-	// 1. If EnableCentralTLSConfig AND APIServer has TLS → use APIServer TLS
-	// 2. Otherwise → user-specified config takes effect (handled by component itself)
-	if tlsEnvVars := oe.resolveTLSConfig(); tlsEnvVars != nil {
-		transformers = append(transformers, injectTLSConfig(tlsEnvVars))
-		logger.Infof("Injecting central TLS config: MinVersion=%s", tlsEnvVars.MinVersion)
+	// Use TLS config resolved in PreReconcile
+	if oe.resolvedTLSConfig != nil {
+		transformers = append(transformers, injectTLSConfig(oe.resolvedTLSConfig))
 	}
 
 	return transformers
@@ -130,8 +126,8 @@ func (oe openshiftExtension) Transformers(comp v1alpha1.TektonComponent) []mf.Tr
 
 // resolveTLSConfig reads TLS config from the shared APIServer lister.
 // Returns nil if central TLS is disabled or no TLS config is available.
-func (oe *openshiftExtension) resolveTLSConfig() *occommon.TLSEnvVars {
-	logger := logging.FromContext(oe.ctx)
+func (oe *openshiftExtension) resolveTLSConfig(ctx context.Context) *occommon.TLSEnvVars {
+	logger := logging.FromContext(ctx)
 
 	tc, err := oe.tektonConfigLister.Get(v1alpha1.ConfigResourceName)
 	if err != nil {
@@ -144,7 +140,7 @@ func (oe *openshiftExtension) resolveTLSConfig() *occommon.TLSEnvVars {
 	}
 
 	// Read TLS config from the shared APIServer lister
-	tlsEnvVars, err := occommon.GetTLSEnvVarsFromAPIServer(oe.ctx, oe.restConfig)
+	tlsEnvVars, err := occommon.GetTLSEnvVarsFromAPIServer(ctx, oe.restConfig)
 	if err != nil {
 		logger.Warnf("Failed to get TLS config from APIServer: %v", err)
 		return nil
@@ -153,20 +149,31 @@ func (oe *openshiftExtension) resolveTLSConfig() *occommon.TLSEnvVars {
 	return tlsEnvVars
 }
 
+// GetHashData returns TLS config fingerprint for hash computation.
+// This ensures installer set is updated when TLS config changes.
 func (oe *openshiftExtension) GetHashData() string {
-	return ""
+	if oe.resolvedTLSConfig == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s:%s:%s", oe.resolvedTLSConfig.MinVersion, oe.resolvedTLSConfig.CipherSuites, oe.resolvedTLSConfig.CurvePreferences)
 }
 
 func (oe *openshiftExtension) PreReconcile(ctx context.Context, tc v1alpha1.TektonComponent) error {
+	logger := logging.FromContext(ctx)
 	result := tc.(*v1alpha1.TektonResult)
-	mf := mf.Manifest{}
+	manifest := mf.Manifest{}
 
 	if (result.Spec.LokiStackName != "" && result.Spec.LokiStackNamespace != "") ||
 		strings.EqualFold(result.Spec.LogsType, "LOKI") {
-		mf = mf.Append(*oe.logsRBACManifest)
+		manifest = manifest.Append(*oe.logsRBACManifest)
 	}
 
-	return oe.installerSetClient.PreSet(ctx, tc, &mf, filterAndTransform())
+	oe.resolvedTLSConfig = oe.resolveTLSConfig(ctx)
+	if oe.resolvedTLSConfig != nil {
+		logger.Infof("Injecting central TLS config: MinVersion=%s", oe.resolvedTLSConfig.MinVersion)
+	}
+
+	return oe.installerSetClient.PreSet(ctx, tc, &manifest, filterAndTransform())
 }
 
 func (oe openshiftExtension) PostReconcile(ctx context.Context, tc v1alpha1.TektonComponent) error {
