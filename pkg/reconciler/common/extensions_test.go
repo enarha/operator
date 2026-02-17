@@ -43,6 +43,10 @@ func (t TestExtension) Finalize(context.Context, v1alpha1.TektonComponent) error
 	return nil
 }
 
+func (t TestExtension) GetHashData() string {
+	return ""
+}
+
 func TestExtensions(t *testing.T) {
 	tests := []struct {
 		name     string

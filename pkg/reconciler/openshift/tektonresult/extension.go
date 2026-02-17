@@ -25,6 +25,7 @@ import (
 	mf "github.com/manifestival/manifestival"
 	"github.com/tektoncd/operator/pkg/apis/operator/v1alpha1"
 	operatorclient "github.com/tektoncd/operator/pkg/client/injection/client"
+	tektonConfiginformer "github.com/tektoncd/operator/pkg/client/injection/informers/operator/v1alpha1/tektonconfig"
 	"github.com/tektoncd/operator/pkg/reconciler/common"
 	"github.com/tektoncd/operator/pkg/reconciler/kubernetes/tektoninstallerset/client"
 	occommon "github.com/tektoncd/operator/pkg/reconciler/openshift/common"
@@ -32,6 +33,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
+	"knative.dev/pkg/injection"
 	"knative.dev/pkg/logging"
 )
 
@@ -71,11 +74,17 @@ func OpenShiftExtension(ctx context.Context) common.Extension {
 		logger.Fatalf("Failed to fetch logs RBAC manifest: %v", err)
 	}
 
+	// Get TektonConfig lister to check EnableCentralTLSConfig flag
+	tektonConfigLister := tektonConfiginformer.Get(ctx).Lister()
+
 	ext := &openshiftExtension{
 		installerSetClient: client.NewInstallerSetClient(operatorclient.Get(ctx).OperatorV1alpha1().TektonInstallerSets(),
 			version, "results-ext", v1alpha1.KindTektonResult, nil),
-		routeManifest:    routeManifest,
-		logsRBACManifest: logsRBACManifest,
+		routeManifest:      routeManifest,
+		logsRBACManifest:   logsRBACManifest,
+		tektonConfigLister: tektonConfigLister,
+		restConfig:         injection.GetConfig(ctx),
+		ctx:                ctx,
 	}
 	return ext
 }
@@ -84,12 +93,18 @@ type openshiftExtension struct {
 	installerSetClient *client.InstallerSetClient
 	routeManifest      *mf.Manifest
 	logsRBACManifest   *mf.Manifest
+	tektonConfigLister interface {
+		Get(name string) (*v1alpha1.TektonConfig, error)
+	}
+	restConfig *rest.Config
+	ctx        context.Context
 }
 
 func (oe openshiftExtension) Transformers(comp v1alpha1.TektonComponent) []mf.Transformer {
 	instance := comp.(*v1alpha1.TektonResult)
+	logger := logging.FromContext(oe.ctx)
 
-	return []mf.Transformer{
+	transformers := []mf.Transformer{
 		occommon.RemoveRunAsUser(),
 		occommon.RemoveRunAsGroup(),
 		occommon.ApplyCABundlesToDeployment,
@@ -101,6 +116,45 @@ func (oe openshiftExtension) Transformers(comp v1alpha1.TektonComponent) []mf.Tr
 		injectResultsAPIServiceCACert(instance.Spec.ResultsAPIProperties),
 		injectPostgresUpgradeSupport(),
 	}
+
+	// Resolve TLS configuration with proper precedence:
+	// 1. If EnableCentralTLSConfig AND APIServer has TLS → use APIServer TLS
+	// 2. Otherwise → user-specified config takes effect (handled by component itself)
+	if tlsEnvVars := oe.resolveTLSConfig(); tlsEnvVars != nil {
+		transformers = append(transformers, injectTLSConfig(tlsEnvVars))
+		logger.Infof("Injecting central TLS config: MinVersion=%s", tlsEnvVars.MinVersion)
+	}
+
+	return transformers
+}
+
+// resolveTLSConfig reads TLS config from the shared APIServer lister.
+// Returns nil if central TLS is disabled or no TLS config is available.
+func (oe *openshiftExtension) resolveTLSConfig() *occommon.TLSEnvVars {
+	logger := logging.FromContext(oe.ctx)
+
+	tc, err := oe.tektonConfigLister.Get(v1alpha1.ConfigResourceName)
+	if err != nil {
+		return nil
+	}
+
+	// Check if central TLS config is enabled
+	if !tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig {
+		return nil
+	}
+
+	// Read TLS config from the shared APIServer lister
+	tlsEnvVars, err := occommon.GetTLSEnvVarsFromAPIServer(oe.ctx, oe.restConfig)
+	if err != nil {
+		logger.Warnf("Failed to get TLS config from APIServer: %v", err)
+		return nil
+	}
+
+	return tlsEnvVars
+}
+
+func (oe *openshiftExtension) GetHashData() string {
+	return ""
 }
 
 func (oe *openshiftExtension) PreReconcile(ctx context.Context, tc v1alpha1.TektonComponent) error {
@@ -463,6 +517,72 @@ func injectPostgresUpgradeSupport() mf.Transformer {
 
 		// Convert back to unstructured
 		uObj, err := k8sruntime.DefaultUnstructuredConverter.ToUnstructured(sts)
+		if err != nil {
+			return err
+		}
+		u.SetUnstructuredContent(uObj)
+		return nil
+	}
+}
+
+// injectTLSConfig injects the TLS configuration as environment variables into the Results API deployment
+func injectTLSConfig(tlsEnvVars *occommon.TLSEnvVars) mf.Transformer {
+	return func(u *unstructured.Unstructured) error {
+		if u.GetKind() != "Deployment" || u.GetName() != deploymentAPI {
+			return nil
+		}
+
+		d := &appsv1.Deployment{}
+		if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(u.Object, d); err != nil {
+			return err
+		}
+
+		for i, container := range d.Spec.Template.Spec.Containers {
+			if container.Name != apiContainerName {
+				continue
+			}
+
+			envVars := []corev1.EnvVar{}
+			if tlsEnvVars.MinVersion != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  occommon.TLSMinVersionEnvVar,
+					Value: tlsEnvVars.MinVersion,
+				})
+			}
+			if tlsEnvVars.CipherSuites != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  occommon.TLSCipherSuitesEnvVar,
+					Value: tlsEnvVars.CipherSuites,
+				})
+			}
+			// CurvePreferences will be populated once openshift/api#2583 is merged
+			if tlsEnvVars.CurvePreferences != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  occommon.TLSCurvePreferencesEnvVar,
+					Value: tlsEnvVars.CurvePreferences,
+				})
+			}
+
+			// Merge with existing env vars
+			existingEnv := container.Env
+			for _, newEnv := range envVars {
+				found := false
+				for j, existing := range existingEnv {
+					if existing.Name == newEnv.Name {
+						existingEnv[j] = newEnv
+						found = true
+						break
+					}
+				}
+				if !found {
+					existingEnv = append(existingEnv, newEnv)
+				}
+			}
+			d.Spec.Template.Spec.Containers[i].Env = existingEnv
+			break
+		}
+
+		uObj, err := k8sruntime.DefaultUnstructuredConverter.ToUnstructured(d)
 		if err != nil {
 			return err
 		}
