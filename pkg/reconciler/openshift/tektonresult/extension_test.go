@@ -28,6 +28,7 @@ import (
 	fake2 "github.com/tektoncd/operator/pkg/client/clientset/versioned/fake"
 	"github.com/tektoncd/operator/pkg/reconciler/common"
 	"github.com/tektoncd/operator/pkg/reconciler/kubernetes/tektoninstallerset/client"
+	occommon "github.com/tektoncd/operator/pkg/reconciler/openshift/common"
 	"gotest.tools/v3/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -490,6 +491,78 @@ func Test_injectPostgresUpgradeSupport_SkipsNonStatefulSet(t *testing.T) {
 		"Init containers should not be modified for Deployment resources")
 	assert.Equal(t, len(deploymentResult.Spec.Template.Spec.Volumes), originalVolumeCount,
 		"Volumes should not be modified for Deployment resources")
+}
+
+func TestGetPlatformData(t *testing.T) {
+	tests := []struct {
+		name      string
+		tlsConfig *occommon.TLSEnvVars
+		expectNe  string
+	}{
+		{
+			name:      "nil config returns empty",
+			tlsConfig: nil,
+			expectNe:  "",
+		},
+		{
+			name: "full config",
+			tlsConfig: &occommon.TLSEnvVars{
+				MinVersion:   "1.2",
+				CipherSuites: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+			},
+		},
+		{
+			name:      "empty struct",
+			tlsConfig: &occommon.TLSEnvVars{},
+		},
+		{
+			name: "only min version",
+			tlsConfig: &occommon.TLSEnvVars{
+				MinVersion: "1.3",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ext := &openshiftExtension{resolvedTLSConfig: tt.tlsConfig}
+			result := ext.GetPlatformData()
+			if tt.tlsConfig == nil {
+				assert.Equal(t, result, "")
+			} else {
+				assert.Assert(t, result != "")
+			}
+		})
+	}
+}
+
+func TestGetPlatformDataStability(t *testing.T) {
+	config := &occommon.TLSEnvVars{
+		MinVersion:   "1.2",
+		CipherSuites: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+	}
+	ext := &openshiftExtension{resolvedTLSConfig: config}
+	first := ext.GetPlatformData()
+	second := ext.GetPlatformData()
+	assert.Equal(t, first, second)
+}
+
+func TestGetPlatformDataChangesOnConfigChange(t *testing.T) {
+	ext := &openshiftExtension{
+		resolvedTLSConfig: &occommon.TLSEnvVars{
+			MinVersion:   "1.2",
+			CipherSuites: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		},
+	}
+	before := ext.GetPlatformData()
+
+	ext.resolvedTLSConfig = &occommon.TLSEnvVars{
+		MinVersion:   "1.3",
+		CipherSuites: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+	}
+	after := ext.GetPlatformData()
+
+	assert.Assert(t, before != after)
 }
 
 func Test_injectPostgresUpgradeSupport_Idempotent(t *testing.T) {
